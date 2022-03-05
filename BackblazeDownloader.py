@@ -276,12 +276,12 @@ class BackBlazeSession():
             ChunksToDownload.sort(key=lambda a:a[0], reverse=True)
             
             #First check if the output file exists, if it does not then create it
-            if not os.path.exists(os.path.join(WorkingDirectory, self.__restore['display_filename'])):
-                with open(os.path.join(WorkingDirectory, self.__restore['display_filename']), 'wb') as fil:
+            if not os.path.exists(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename'])):
+                with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']), 'wb') as fil:
                     pass
 
             #Now that the file exists open it for writing/modification
-            outputfile = open(os.path.join(WorkingDirectory, self.__restore['display_filename']), 'rb+')
+            outputfile = open(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']), 'rb+')
 
             #Open the log file so we can log after each piece is fetched so we may recover from a crash/power failure ect
             with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['rid']), 'ab+') as logfile:
@@ -771,11 +771,16 @@ if __name__ == '__main__':
 
     while True:        
         BB = BackBlazeSession(Email, Password, DiskIOEvent, TokenBucketInst, WorkingDirectory, OutputDirectory, threads)
+        
+        #Track if we have found a file to download in this iteration, if we have not then we will sleep for 15 minutes before checking again, otherwise check again immediatly
+        FileFound = False
 
         #Iterate over restores and search for any that we have not yet downloaded that are not in progress
         for a in BB.Restores:
             if a.rid not in DownloadedBackups:
                 if a.restore_in_progress == 'false':
+                    FileFound = True
+
                     ZipPath = a.Download()
                     
                     #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
@@ -792,7 +797,19 @@ if __name__ == '__main__':
                     with open('Downloaded.db', 'a') as fil:
                         fil.write(str(a.rid) + '\n')
 
-        #Wait 15 minutes before checking again for more files to download
-        print ('Waiting for more restores to be available')
-        time.sleep(900)
+            else:#If we have already downloaded this backup, check to make sure the zipfile has been moved/extract and if not add it to the queue
+                ZipPath = os.path.join(WorkingDirectory, a.display_filename)
+                
+                if os.path.exists(ZipPath):
+                    #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
+                    if Extract:
+                        zipjobqueue.put(ZipPath)
+
+                    else:#Otherwise just move the downloaded file to the output location
+                        shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
+
+        #Wait 15 minutes before checking again for more files to download but only if we did not find any files to download
+        if not FileFound:
+            print ('Waiting for more restores to be available')
+            time.sleep(900)
     
