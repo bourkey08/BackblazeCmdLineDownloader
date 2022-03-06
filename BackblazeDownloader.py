@@ -73,7 +73,7 @@ def ParseBinaryUnits(inputval):
         return Units[unit](value)
 
 class BackBlazeSession():
-    def __init__(self, Email, Password, DiskIOEvent, TokenBucketInst, WorkingDirectory='temp', OutputDir='data', threads=32):
+    def __init__(self, Email, Password, DiskIOEvent, TokenBucketInst, DiskBuffer, WorkingDirectory='temp', OutputDir='data', threads=32):
         self.__sess = requests.session()
         self.__Email = Email
         self.__Password = Password
@@ -83,6 +83,7 @@ class BackBlazeSession():
         self._threads = threads
         self._DiskIOEvent = DiskIOEvent
         self._TokenBucket = TokenBucketInst
+        self._DiskBuffer = DiskBuffer
 
         #Now create the thread pool and the process pool
         self._tpool = ThreadPool(threads)
@@ -257,8 +258,8 @@ class BackBlazeSession():
             ToDownloadChunks = TotalChunks
 
             #First check if there is log for this restore and if there is load the list of chunks that have already been downloaded
-            if os.path.exists(os.path.join(self.__parent._WorkingDirectory, self.__restore['rid'])):
-                with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['rid']), 'rb') as fil:
+            if os.path.exists(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename'] + '.db')):
+                with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename'] + '.db'), 'rb') as fil:
                     entry = fil.read(16)
 
                     while entry:
@@ -273,112 +274,75 @@ class BackBlazeSession():
                         entry = fil.read(16)
             
             #And now sort chunks to download into reverse order by the start position, we want them in reverse order as well iterate over the list backwards so we can remove elements inplace
-            ChunksToDownload.sort(key=lambda a:a[0], reverse=True)
+            ChunksToDownload.sort(key=lambda a:a[0], reverse=True)            
             
-            #First check if the output file exists, if it does not then create it
-            if not os.path.exists(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename'])):
-                with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']), 'wb') as fil:
-                    pass
+            #Define a list for keeping track of in progress downloads format is [(thread, starttime),]
+            results = []               
 
-            #Now that the file exists open it for writing/modification
-            outputfile = open(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']), 'rb+')
+            #Now lets start downloading missing pieces of the file until we have all pieces
+            while len(ChunksToDownload) > 0 or len(results) > 0:    
+                #Iterate over the list of entrys in results list and retreive the output of any finished jobs then remove them from the list
+                for x in xrange(len(results) - 1, -1, -1):          
+                    #If this job has finished executing
+                    if results[x][0].ready():
+                        result = results[x][0].get()
 
-            #Open the log file so we can log after each piece is fetched so we may recover from a crash/power failure ect
-            with open(os.path.join(self.__parent._WorkingDirectory, self.__restore['rid']), 'ab+') as logfile:
-                #Define a list for keeping track of in progress downloads format is [(thread, starttime),]
-                results = []               
+                        #If fetching the chunk failed, add it back into the list of missing chunks
+                        if result[0] != True:
+                            if not ChunkRetryCount.has_key((result[1], result[2])):                                                                       
+                                ChunksToDownload.append((result[1], result[2]))
+                                ChunkRetryCount[(result[1], result[2])] = 1 
+                                
+                            elif ChunkRetryCount[(result[1], result[2])] < 10:
+                                ChunksToDownload.append((result[1], result[2]))
+                                ChunkRetryCount[(result[1], result[2])] += 1
 
-                #Now lets start downloading missing pieces of the file until we have all pieces
-                while len(ChunksToDownload) > 0 or len(results) > 0:
-                    #Count the number of results that are ready and awaiting writing to disk, if its > than 40% then clear then clear the disk IO event to pause the zip extractor
-                    #We are doing this when there are at least 40% of jobs waiting to write out as the thread pool is kept filled with jobs to 250% of running threads so that when a thread finishes 
-                    #there is always another chunk waiting to start downloading immediatly and there is additional space for a number of completed jobs to sit in memory pending writing to disk
-                    #40% allows for (Running Threads + (RunningThreads / 2 pending jobs)) + RunningThreads * 1.5 in output buffer before it triggers the zip extractor to stop
-                    CompletedCount = 0
-                    for job in results:
-                        if job[0].ready():
-                            CompletedCount += 1
+                            else:
+                                ChunksToDownload.append((result[1], result[2]))
+                                print ('Failed to download chunk: {0}-{1}'.format(result[1], result[2]))
+                                print ('')
 
-                    if CompletedCount > len(results) * 0.4:
-                        self.__parent._DiskIOEvent.clear()
+                        else:#Otherwise insert the returned data at the correct location in the memory mapped file                                                             
+                            #Add the downloaded chunk to the output buffer
+                            self.__parent._DiskBuffer.write(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']), (result[1], result[2]), result[3])                              
+                           
+                            #Mark the disk buffer as requiring flushing, but only after all other results have been written
+                            AnyResultsFound = True
 
-                    #Iterate over the list of entrys in results list and retreive the output of any finished jobs then remove them from the list
-                    for x in xrange(len(results) - 1, -1, -1):
-                        #Track if any jobs have returned so that we can flush both the log file and the output file if we have written at least 1 chunk
-                        AnyResultsFound = False
+                            #And increment downloaded chunks by 1
+                            DownloadedChunks += 1     
+                            ToDownloadChunks -= 1
 
-                        #If this job has finished executing
-                        if results[x][0].ready():
-                            result = results[x][0].get()
+                        #And remove the entry from the results list
+                        del results[x]                    
 
-                            #If fetching the chunk failed, add it back into the list of missing chunks
-                            if result[0] != True:
-                                if not ChunkRetryCount.has_key((result[1], result[2])):                                                                       
-                                    ChunksToDownload.append((result[1], result[2]))
-                                    ChunkRetryCount[(result[1], result[2])] = 1 
-                                    
-                                elif ChunkRetryCount[(result[1], result[2])] < 10:
-                                    ChunksToDownload.append((result[1], result[2]))
-                                    ChunkRetryCount[(result[1], result[2])] += 1
+                #Make sure there are enough jobs queueed up to keep the thread pool busy, note ram usage when waiting on disk io will be this value * 16MB + Disk Cache * 16MB
+                while len(results) < self.__parent._threads +1 and len(ChunksToDownload) > 0:
+                    #Submit tasks to the threadpool to download all missing chunks, max concurrency is limited by pool size
+                    for x in xrange(len(ChunksToDownload) -1, -1, -1):                             
+                        results.append([self.__parent._tpool.apply_async(self.__DownloadPiece, (ChunksToDownload[x][0], ChunksToDownload[x][1],self.__parent._TokenBucket)), time.time()])
 
-                                else:
-                                    ChunksToDownload.append((result[1], result[2]))
-                                    print ('Failed to download chunk: {0}-{1}'.format(result[1], result[2]))
-                                    print ('')
+                        del ChunksToDownload[x]
 
-                            else:#Otherwise insert the returned data at the correct location in the memory mapped file                                                             
-                                outputfile.seek(result[1])
-                                outputfile.write(result[3])
+                        #If the target backlog size has been reached, stop adding new tasks
+                        if len(results) >= self.__parent._threads + 1:
+                            break
+                
+                #Finally update the current status
+                if LastConsoleUpdate < time.time() -1:
+                    print (' ' * 100, end='\r')#Clear previous line
+                    print ('Downloading: {0}%  {1}'.format(                        
+                        '{:.2f}'.format((1 - (ToDownloadChunks / float(TotalChunks))) * 100),
+                        BinaryFormat((DownloadedChunks*0xffffff) / (time.time() - StartTime), 'ps')                        
+                    ), end='\r')
 
-                                #And log that this chunk has been downloaded
-                                logfile.write(struct.pack('QQ', result[1], result[2]))                               
-                               
-                                #Mark the disk buffer as requiring flushing, but only after all other results have been written
-                                AnyResultsFound = True
+                    LastConsoleUpdate = time.time()
 
-                                #And increment downloaded chunks by 1
-                                DownloadedChunks += 1     
-                                ToDownloadChunks -= 1
+                #Wait 0.1 second before checking progress again
+                time.sleep(0.1)
 
-                            #And remove the entry from the results list
-                            del results[x]                      
-
-                        #Flush the output file to disk followed by the log file to ensure we have a consistent state in the event the program is interupted
-                        if AnyResultsFound:
-                            outputfile.flush()                            
-                            logfile.flush()
-
-                    #Now after writing all chunks to disk, set the io event to enabled again to resume the zip extractor(if it was paused, this has no effect if we did not pause it)
-                    self.__parent._DiskIOEvent.set()
-
-                    #Make sure there are enough jobs queueed up to keep the thread pool busy, the larger
-                    #This value the more data may be sitting in ram waiting being written out but the more consistent transfer speeds will be
-                    while len(results) < (self.__parent._threads * 2.5) +1 and len(ChunksToDownload) > 0:
-                        #Submit tasks to the threadpool to download all missing chunks, max concurrency is limited by pool size
-                        for x in xrange(len(ChunksToDownload) -1, -1, -1):                             
-                            results.append([self.__parent._tpool.apply_async(self.__DownloadPiece, (ChunksToDownload[x][0], ChunksToDownload[x][1],self.__parent._TokenBucket)), time.time()])
-
-                            del ChunksToDownload[x]
-
-                            #If the target backlog size has been reached, stop adding new tasks
-                            if len(results) >= (self.__parent._threads * 2.5) +1:
-                                break
-                    
-                    #Finally update the current status
-                    if LastConsoleUpdate < time.time() -1:
-                        print (' ' * 100, end='\r')#Clear previous line
-                        print ('Downloading: {0}%  {1}'.format(                        
-                            '{:.2f}'.format((1 - (ToDownloadChunks / float(TotalChunks))) * 100),
-                            BinaryFormat((DownloadedChunks*0xffffff) / (time.time() - StartTime), 'ps')                        
-                        ), end='\r')
-
-                        LastConsoleUpdate = time.time()
-
-                    #Wait 0.1 second before checking progress again
-                    time.sleep(0.1)
-
-            #Finally the file has finished downloading, close all open file handles and return the path of the output file
-            outputfile.close()
+            #Flush the file to disk before returning, this ensures all file handles are closed 
+            self.__parent._DiskBuffer.flush(os.path.join(self.__parent._WorkingDirectory, self.__restore['display_filename']))
 
             return os.path.join(WorkingDirectory, self.__restore['display_filename'])
 
@@ -424,6 +388,9 @@ class ZipExtrator(threading.Thread):
         self.__ZipRegex = ZipRegex
         self.__ZipOutPath = ZipOutPath
         self.__KeepZips = KeepZips
+
+        #Automatically start the thread when its first created
+        self.start()
 
     #Main event loop
     def run(self):
@@ -585,13 +552,213 @@ class TokenBucket():
         #And return the number of bytes obtained
         return GotBytes
 
+#Implement a write buffer for writing downloaded chunks to disk, takes a single argument BufferSize, this is the number of chunks to allow in buffer (each chunk is 16MB)
+#This allows chunks that have been downloaded to be placed into a queue to be written out to disk in order to allow the threads to immediatly start downloading the next chunk without waiting for disk io
+#The ideal size of the write buffer will depend on Disk IO latency, Internet bandwith and available Ram to use as a cache. 
+#On fast flash storage/slow connections this can be set very low to reduce ram usage without impacting download speed.
 class WriteBuffer(threading.Thread):
-    def __init__(self):
+    #Size sets the queue size(16MB per entry), MaxIdle determins how long a file will be kept open without any writes
+    def __init__(self, DiskIOEvent, Size=10, MaxIdle=30):
         threading.Thread.__init__(self)
 
+        self.__MaxIdle = MaxIdle
+        self.__DiskIOEvent = DiskIOEvent
+
+        #Define a queue that entrys needing to be written to disk will be added to
+        self.__WriteBuffer = Queue.Queue(Size)
+
+        #And define a dict that we will use to keep track of the number of chunks in the queue for each file, this allows waiting for a file to completly write to disk when flush() is called
+        self.__FileChunkCount = {};
+        self.__FileChunkLock = threading.Lock()#And we need a lock to ensure 2 threads dont try to modify the dict at the same time
+
+        #Define a dict for storing open file handles, this allows a file to be held open for a period of time rather than being opened and closed for each write
+        self.__FileHandles = {}#Format is filename: {'handle': fp, 'dbhandle': fp, 'LastUsed': time.time()}
+        self.__FileHandlesCleanupLock = threading.Lock()#Prevents filehandles being removed when a flush operation is waiting to close them explicitly
+
+        #Automaticlaly start the thread when its first created
+        self.start()
+
     def run(self):
-        pass
-        
+        #Keep track of the last time we checked for idle files, we only want to do this once per second rather than after each chunk 
+        LastIdleCheck = time.time()
+
+        while True:
+            #If the queue is less than 50% full, resume disk extractor IO
+            if self.__WriteBuffer.qsize() / float(self.__WriteBuffer.maxsize) < 0.5:
+                self.__DiskIOEvent.set()
+
+            #Wait for more data to be added to the queue, use a 1 second delay so that we can periodically wake up even if there no new data to close idle files
+            try:
+                Entry = self.__WriteBuffer.get(timeout=1)
+
+            except Queue.Empty:#If the queue is empty this will raise an Empty error so set entry to None
+                Entry = None
+
+            #If the current queue length is >= than 50% of its capacity, pause the zip extractors IO
+            if self.__WriteBuffer.qsize() / float(self.__WriteBuffer.maxsize) >= 0.5:
+                self.__DiskIOEvent.clear()
+
+            #If we have retreived an entry to write out, do that now
+            if Entry != None:
+                #Make sure we have the file open and if we dont open it now
+                if self.__FileHandles.has_key(Entry[0]) == False:
+                    self.__FileHandles[Entry[0]] = {                        
+                        'LastUsed': 0
+                    }
+
+                    #Make sure the directory for the file exists and create it if its missing
+                    if os.path.split(Entry[0])[0] != '':#If the file is being written to a sub directory
+                        if not os.path.exists(os.path.split(Entry[0])[0]):
+                            os.makedirs(os.path.split(Entry[0])[0])
+
+                    #Make sure the file exists, if it does not create an empty file
+                    if not os.path.exists(Entry[0]):
+                        with open(Entry[0], 'wb') as fil:
+                            pass
+
+                    #Now open the file 
+                    self.__FileHandles[Entry[0]]['handle'] = open(Entry[0], 'rb+')
+
+                    #Now open the db file for appending
+                    self.__FileHandles[Entry[0]]['dbhandle'] = open(Entry[0] + '.db', 'ab+')
+
+                #Now write the data to the specified position in the file (position is specified as a tuple of (start, end))
+                self.__FileHandles[Entry[0]]['handle'].seek(Entry[1][0])
+                self.__FileHandles[Entry[0]]['handle'].write(Entry[2])
+
+                #And log that this chunk has been downloaded
+                self.__FileHandles[Entry[0]]['dbhandle'].write(struct.pack('QQ', Entry[1][0], Entry[1][1])) 
+
+                #And now flush the files to disk, this prevents data loss if the program is closed when there are still open file handles (although we will use __del__ to attempt to flush buffer on close)
+                self.__FileHandles[Entry[0]]['handle'].flush()
+                self.__FileHandles[Entry[0]]['dbhandle'].flush()
+
+                #Now decrease the pending chunks for this file by 1
+                try:
+                    self.__FileChunkLock.acquire()
+
+                    self.__FileChunkCount[Entry[0]] -= 1
+
+                finally:
+                    self.__FileChunkLock.release()
+
+                #Finally update the last used time of the file
+                self.__FileHandles[Entry[0]]['LastUsed'] = time.time()                    
+
+            #Now if we have not checked for idle files for >= 1 second, do that now
+            if time.time() - 1 > LastIdleCheck:
+                #Try to aquire the lock required to cleanup file handles, if this fails, skip cleanup operation
+                if not self.__FileHandlesCleanupLock.acquire(False):
+                    continue         
+
+                for key in self.__FileHandles.keys():
+                    if self.__FileHandles[key]['LastUsed'] < time.time() - self.__MaxIdle:
+                        #Make sure there are no pending writes for this file in the queue, if there are then keep the file open until those writes complete
+                        try:
+                            self.__FileChunkLock.acquire()
+
+                            if self.__FileChunkCount.has_key(key):
+                                if self.__FileChunkCount[key] > 0:
+                                    continue#Pending data in the write queue, skip this entry and keep it open
+
+                            #Otherwise lets close the file
+                            self.__FileHandles[key]['handle'].close()
+                            self.__FileHandles[key]['dbhandle'].close()
+
+                            #Remove the entry from the file handles dict as the file has now been closed
+                            del self.__FileHandles[key]
+
+                            #And remove the chunk count for this file (as its 0)
+                            if self.__FileChunkCount.has_key(key):
+                                del self.__FileChunkCount[key]                                
+
+                        finally:
+                            self.__FileChunkLock.release()
+
+                #Finally update the last idle check to be now
+                LastIdleCheck = time.time()
+
+                #And release the cleanup lock
+                self.__FileHandlesCleanupLock.release()
+
+    #Waits for all pending writes to a file to complete and then closes the file handle
+    def flush(self, filename):   
+        try:
+            #Aquire the cleanup lock to ensure that the file handle is not removed by automatic cleanup operations while we are waiting for it to complete
+            self.__FileHandlesCleanupLock.acquire()
+
+            #If there is no entry in the filehandles dict for this file then return immediatly
+            if not self.__FileHandles.has_key(filename):
+                return True
+
+            while True:
+                #As flush is blocking, pause disk io from the zip extractor until it completes
+                self.__DiskIOEvent.clear()
+
+                try:
+                    self.__FileChunkLock.acquire()
+
+                    #Is there still pending data to be written?
+                    if self.__FileChunkCount.has_key(filename):                    
+                        if self.__FileChunkCount[filename] > 0:                        
+                            continue#Pending data in the write queue, skip this entry and keep it open
+                    
+                    self.__FileHandles[filename]['handle'].close()
+                    self.__FileHandles[filename]['dbhandle'].close()
+
+                    #Remove the entry from the file handles dict as the file has now been closed
+                    del self.__FileHandles[filename]
+
+                    #And remove the chunk count for this file (as its 0)
+                    if self.__FileChunkCount.has_key(filename):
+                        del self.__FileChunkCount[filename]
+
+                    #And restart the zip extractor if running
+                    self.__DiskIOEvent.set()
+
+                    return True
+
+                finally:
+                    self.__FileChunkLock.release()
+
+                #Wait 100ms between checking if the file has been closed
+                time.sleep(0.1)
+        finally:
+            self.__FileHandlesCleanupLock.release()
+
+    #Writes the specified data to the file at the specified position
+    def write(self, filename, pos, data):
+        #Get an exclusive lock on the file chunk count
+        try:
+            self.__FileChunkLock.acquire()
+
+            #Increment the pending chunks for this file by 1, creating the key if its not yet present
+            if not self.__FileChunkCount.has_key(filename):
+                self.__FileChunkCount[filename] = 1
+            else:
+                self.__FileChunkCount[filename] += 1
+        finally:
+            self.__FileChunkLock.release()     
+
+        #Now add an entry to the queue to write this chunk to disk, this will block if the write buffer is full
+        self.__WriteBuffer.put([filename, pos, data])
+
+    #Returns the current writebuffer queue length
+    @property
+    def QueueLength(self):
+        return self.__WriteBuffer.qsize()
+
+    #Called when the write buffer instance is destroyed, flushes any current entrys to disk
+    def __del__(self):
+        try:
+            self.__FileChunkLock.acquire()
+
+            for key in self.__FileChunkCount.iterkeys():
+                self.flush(key)
+
+        finally:
+            self.__FileChunkLock.release()
+
 #Print help info to the console
 def ShowHelp():
     print ('''    
@@ -605,9 +772,11 @@ Additional Options:
     -licence - Print the licence details to console
     -licence=full - Prints a copy of the Entire GPL V3 Licence
 
-    -threads - Sets how many threads should be run in parallel when downloading backups, default is 32.
+    -threads - Sets how many threads should be run in parallel when downloading backups. Default: 32.
     -zipregex=regularexpression,targetpath - This argument can be specified multiple times and overwrites the path that files will be extracted to for any files that match the provided regular expression
         Example: -zipregex=^c\\/users\\/test\\/.*,d:\\testuser would extract all files with the path c/users/test to d:\testusers, all other files would be put in the folder specified by -outputdir
+
+    -writebuffer=<int> - Sets the size of the write buffer in 16MB chunks (eg a value of 10 will use 160MB of ram for the write buffer) Default: 10
 
 Additional Notes:
     Closing this program during a download will not cause the download to be restarted from the begining.
@@ -667,6 +836,7 @@ if __name__ == '__main__':
     Password = None
     WorkingDirectory = 'temp'
     OutputDirectory = None
+    writebuffersize = 10
 
     Extract = False
     KeepZip=True
@@ -753,6 +923,21 @@ if __name__ == '__main__':
         elif field == 'zipregex':
             ZipRegex.append((value.split(',')[0], value.split(',')[1]))
 
+
+        #Set the size of the write buffer, this must be an integer between 1 and ((available ram / 16MB) - threadcount)
+        elif field == 'writebuffer':
+            try:
+                writebuffersize = int(value)
+            except:
+                print ('Invalid value for writebuffer')
+                exit(0)
+
+    #If the user has not provided the bare minimum arguments, default to showing help
+    if Email == None or Password == None or OutputDirectory == None:
+        ShowHelp()
+        raw_input('')
+        exit(0)
+
     #Define an event that will be passed to both the downloader and the zipextractor if enabled, this allows the downloader to signal to the zip extractor that it needs the zip extractor to stop IO operations
     #This allows the downloader to temporally pause the zip extractor in the event its being bottlenecked by writing output chunks to disk due to the zip extractor maxing disk iops
     DiskIOEvent = threading.Event()
@@ -765,19 +950,15 @@ if __name__ == '__main__':
         
         #And get an instance of the zip extractor and start it in its own thread, this allows the next zip file to begin downloading while the previous one is being extracted
         zipextrator = ZipExtrator(zipjobqueue, DiskIOEvent, ZipRegex, OutputDirectory, KeepZip)
-        zipextrator.start()
+
+    #Create an instance of the disk buffer object and pass in the DiskIOEvent
+    DiskBuffer = WriteBuffer(DiskIOEvent, writebuffersize)
 
     #If a throtte was specified, get a throttler object, if throttle is false this returns an object that always immediatly returns 
     TokenBucketInst = TokenBucket(Throttle)
 
-    #If the user has not provided the bare minimum arguments, default to showing help
-    if Email == None or Password == None or OutputDirectory == None:
-        ShowHelp()
-        raw_input('')
-        exit(0)
-
     while True:        
-        BB = BackBlazeSession(Email, Password, DiskIOEvent, TokenBucketInst, WorkingDirectory, OutputDirectory, threads)
+        BB = BackBlazeSession(Email, Password, DiskIOEvent, TokenBucketInst, DiskBuffer, WorkingDirectory, OutputDirectory, threads)
         
         #Track if we have found a file to download in this iteration, if we have not then we will sleep for 15 minutes before checking again, otherwise check again immediatly
         FileFound = False
