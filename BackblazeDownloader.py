@@ -585,6 +585,13 @@ class TokenBucket():
         #And return the number of bytes obtained
         return GotBytes
 
+class WriteBuffer(threading.Thread):
+    def __init__(self):
+        threading.Thread.__init__(self)
+
+    def run(self):
+        pass
+        
 #Print help info to the console
 def ShowHelp():
     print ('''    
