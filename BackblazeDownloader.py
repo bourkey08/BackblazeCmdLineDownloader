@@ -15,19 +15,13 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 '''
-from __future__ import print_function
-
-#Supress the warning about cryptography not supporting python 2.7 in the next release, will update code to be python 3 compatable
-import warnings
-warnings.filterwarnings("ignore")
-
-import requests, json, hashlib, os, zipfile, struct, time, shutil, sys, re, string, threading, Queue, logging
+import requests, json, hashlib, os, zipfile, struct, time, shutil, sys, re, string, threading, queue, logging, codecs
 import multiprocessing.pool
 from multiprocessing.pool import ThreadPool
 from lxml import etree
 
 def BinaryFormat(size, suffix=''):
-    size = long(size)
+    size = int(size)
 
     Units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB', 'EB']
 
@@ -66,7 +60,7 @@ def ParseBinaryUnits(inputval):
         else:
             unit += a
 
-    if not Units.has_key(unit):
+    if unit not in Units:
         return None
 
     else:
@@ -103,7 +97,7 @@ class BackBlazeSession():
 
     #Implement the hash function that backblaze uses as a sort of checksum for requests
     def BZSanity(self, text):
-        hashedstring = hashlib.sha1(text.encode('hex').lower()).hexdigest().lower()
+        hashedstring = hashlib.sha1(codecs.encode(text.encode(), 'hex').lower()).hexdigest().lower()
 
         return hashedstring[1] + hashedstring[3] + hashedstring[5] + hashedstring[7]
 
@@ -141,29 +135,29 @@ class BackBlazeSession():
             self.__authToken = authToken
 
         def __getattr__(self, item):
-            if self.__restore.has_key(item):
+            if item in self.__restore:
                 return self.__restore[item]
             else:
                 raise AttributeError
 
         def __getitem__(self, item):
-            if self.__restore.has_key(item):
+            if item in self.__restore:
                 return self.__restore[item]
             else:
                 return AttributeError
 
         def iterkeys(self):
-            return self.__restore.iterkeys()
+            return iter(self.__restore.keys())
 
         def keys(self):
-            return self.__restore.keys()
+            return list(self.__restore.keys())
 
         def __iter__(self):
-            for key in self.__restore.iterkeys():
+            for key in self.__restore.keys():
                 yield key, self.__restore[key]
 
         def __repr__(self):
-                if self.__restore.has_key('display_filename'):
+                if 'display_filename' in self.__restore:
                     return self.__restore['display_filename']
                 else:
                     return self.__restore['filename']
@@ -181,10 +175,10 @@ class BackBlazeSession():
 
             postdata = {
                 'version': '8.0.1.567',
-                'hexemailaddr': self.__Email.encode('hex'),
+                'hexemailaddr': codecs.encode(self.__Email.encode(), 'hex'),
                 'request_firstbyteindex': Start,
                 'request_numbytes': End,
-                'hexpassword': 'Null'.encode('hex'),
+                'hexpassword': codecs.encode(b'Null', 'hex'),
                 'hguid': self.__restore['hguid'],
                 'rid': self.__restore['rid'],
                 'bz_v5_auth_token': self.__restore['bz_auth_token'],
@@ -214,7 +208,7 @@ class BackBlazeSession():
                         #Now request permission to read another 65k
                         _TokenBucket.RequestBytes(0xffff)
 
-                    data = ''.join(data)
+                    data = b''.join(data)
 
                     #Handle the case where the returned data is not the correct length
                     if len(data[24:-56]) != End-Start:                        
@@ -247,8 +241,8 @@ class BackBlazeSession():
             StartTime = time.time()
 
             pos = 0
-            while pos < long(self.__restore['zipsize']):
-                ChunksToDownload.append((pos, min(long(self.__restore['zipsize']), pos+0xffffff)))
+            while pos < int(self.__restore['zipsize']):
+                ChunksToDownload.append((pos, min(int(self.__restore['zipsize']), pos+0xffffff)))
                 pos += 0xffffff
 
                 #Tally up the total number of chunks
@@ -282,14 +276,14 @@ class BackBlazeSession():
             #Now lets start downloading missing pieces of the file until we have all pieces
             while len(ChunksToDownload) > 0 or len(results) > 0:    
                 #Iterate over the list of entrys in results list and retreive the output of any finished jobs then remove them from the list
-                for x in xrange(len(results) - 1, -1, -1):          
+                for x in range(len(results) - 1, -1, -1):          
                     #If this job has finished executing
                     if results[x][0].ready():
                         result = results[x][0].get()
 
                         #If fetching the chunk failed, add it back into the list of missing chunks
                         if result[0] != True:
-                            if not ChunkRetryCount.has_key((result[1], result[2])):                                                                       
+                            if (result[1], result[2]) not in ChunkRetryCount:                                                                       
                                 ChunksToDownload.append((result[1], result[2]))
                                 ChunkRetryCount[(result[1], result[2])] = 1 
                                 
@@ -319,7 +313,7 @@ class BackBlazeSession():
                 #Make sure there are enough jobs queueed up to keep the thread pool busy, note ram usage when waiting on disk io will be this value * 16MB + Disk Cache * 16MB
                 while len(results) < self.__parent._threads +1 and len(ChunksToDownload) > 0:
                     #Submit tasks to the threadpool to download all missing chunks, max concurrency is limited by pool size
-                    for x in xrange(len(ChunksToDownload) -1, -1, -1):                             
+                    for x in range(len(ChunksToDownload) -1, -1, -1):                             
                         results.append([self.__parent._tpool.apply_async(self.__DownloadPiece, (ChunksToDownload[x][0], ChunksToDownload[x][1],self.__parent._TokenBucket)), time.time()])
 
                         del ChunksToDownload[x]
@@ -355,8 +349,8 @@ class BackBlazeSession():
 
         resp = self.__sess.post('https://ca001.backblaze.com/api/restoreinfo', data={
             'version': '8.0.1.567',
-            'hexemailaddr': self.__Email.encode('hex'),
-            'hexpassword': 'Null'.encode('hex')
+            'hexemailaddr': codecs.encode(self.__Email.encode(), 'hex'),
+            'hexpassword': codecs.encode(b'Null', 'hex')
         }, headers={
             'Authorization': self.__SessionData['authToken'],
             'User-Agent': 'backblaze_agent/8.0.1.567'
@@ -369,7 +363,7 @@ class BackBlazeSession():
             for restore in tree.iter('restore'):
                 RestoreEntry = {}
 
-                for key in restore.keys():
+                for key in list(restore.keys()):
                     RestoreEntry[key] = restore.get(key)
 
                 if RestoreEntry['rid'] not in self.__Restores:     
@@ -434,7 +428,7 @@ class ZipExtrator(threading.Thread):
 
                     #Finally extract the file
                     with open(outpath, 'wb') as outfile:
-                        with zipfil.open(zipfil.filelist[1].filename) as infile:
+                        with zipfil.open(_file.filename) as infile:
                             self.__IOEvent.wait()#Wait for the event before every io operation, this causes negligible cpu usage compared to the extraction of the zip file
                             block = infile.read(0xffffff)
 
@@ -466,7 +460,7 @@ class TokenBucket():
         self.__ThrottleLimit = ThrottleLimit
         if ThrottleLimit != False:
             self.__Locks = [threading.Lock(), threading.Lock()]#First lock is for working with state of token bucket, second lock is for working with queue
-            self.__Queue = Queue.Queue()
+            self.__Queue = queue.Queue()
             
             self.__Window = WindowSize / 1000.0
             self.__LastUpdate = time.time()
@@ -565,7 +559,7 @@ class WriteBuffer(threading.Thread):
         self.__DiskIOEvent = DiskIOEvent
 
         #Define a queue that entrys needing to be written to disk will be added to
-        self.__WriteBuffer = Queue.Queue(Size)
+        self.__WriteBuffer = queue.Queue(Size)
 
         #And define a dict that we will use to keep track of the number of chunks in the queue for each file, this allows waiting for a file to completly write to disk when flush() is called
         self.__FileChunkCount = {};
@@ -591,7 +585,7 @@ class WriteBuffer(threading.Thread):
             try:
                 Entry = self.__WriteBuffer.get(timeout=1)
 
-            except Queue.Empty:#If the queue is empty this will raise an Empty error so set entry to None
+            except queue.Empty:#If the queue is empty this will raise an Empty error so set entry to None
                 Entry = None
 
             #If the current queue length is >= than 50% of its capacity, pause the zip extractors IO
@@ -601,7 +595,7 @@ class WriteBuffer(threading.Thread):
             #If we have retreived an entry to write out, do that now
             if Entry != None:
                 #Make sure we have the file open and if we dont open it now
-                if self.__FileHandles.has_key(Entry[0]) == False:
+                if (Entry[0] in self.__FileHandles) == False:
                     self.__FileHandles[Entry[0]] = {                        
                         'LastUsed': 0
                     }
@@ -651,13 +645,13 @@ class WriteBuffer(threading.Thread):
                 if not self.__FileHandlesCleanupLock.acquire(False):
                     continue         
 
-                for key in self.__FileHandles.keys():
+                for key in list(self.__FileHandles.keys()):
                     if self.__FileHandles[key]['LastUsed'] < time.time() - self.__MaxIdle:
                         #Make sure there are no pending writes for this file in the queue, if there are then keep the file open until those writes complete
                         try:
                             self.__FileChunkLock.acquire()
 
-                            if self.__FileChunkCount.has_key(key):
+                            if key in self.__FileChunkCount:
                                 if self.__FileChunkCount[key] > 0:
                                     continue#Pending data in the write queue, skip this entry and keep it open
 
@@ -669,7 +663,7 @@ class WriteBuffer(threading.Thread):
                             del self.__FileHandles[key]
 
                             #And remove the chunk count for this file (as its 0)
-                            if self.__FileChunkCount.has_key(key):
+                            if key in self.__FileChunkCount:
                                 del self.__FileChunkCount[key]                                
 
                         finally:
@@ -688,7 +682,7 @@ class WriteBuffer(threading.Thread):
             self.__FileHandlesCleanupLock.acquire()
 
             #If there is no entry in the filehandles dict for this file then return immediatly
-            if not self.__FileHandles.has_key(filename):
+            if filename not in self.__FileHandles:
                 return True
 
             while True:
@@ -699,7 +693,7 @@ class WriteBuffer(threading.Thread):
                     self.__FileChunkLock.acquire()
 
                     #Is there still pending data to be written?
-                    if self.__FileChunkCount.has_key(filename):                    
+                    if filename in self.__FileChunkCount:                    
                         if self.__FileChunkCount[filename] > 0:                        
                             continue#Pending data in the write queue, skip this entry and keep it open
                     
@@ -710,7 +704,7 @@ class WriteBuffer(threading.Thread):
                     del self.__FileHandles[filename]
 
                     #And remove the chunk count for this file (as its 0)
-                    if self.__FileChunkCount.has_key(filename):
+                    if filename in self.__FileChunkCount:
                         del self.__FileChunkCount[filename]
 
                     #And restart the zip extractor if running
@@ -733,7 +727,7 @@ class WriteBuffer(threading.Thread):
             self.__FileChunkLock.acquire()
 
             #Increment the pending chunks for this file by 1, creating the key if its not yet present
-            if not self.__FileChunkCount.has_key(filename):
+            if filename not in self.__FileChunkCount:
                 self.__FileChunkCount[filename] = 1
             else:
                 self.__FileChunkCount[filename] += 1
@@ -753,7 +747,7 @@ class WriteBuffer(threading.Thread):
         try:
             self.__FileChunkLock.acquire()
 
-            for key in self.__FileChunkCount.iterkeys():
+            for key in self.__FileChunkCount.keys():
                 self.flush(key)
 
         finally:
@@ -846,7 +840,7 @@ if __name__ == '__main__':
     ZipRegex = []
 
     #Now parse any command line arguments, we want to accept arguments in either of 2 formats -arg=value or -arg value
-    for x in xrange(0, len(sys.argv)):
+    for x in range(0, len(sys.argv)):
         if '=' in sys.argv[x] and sys.argv[x].startswith('-'):
             field, _, value = sys.argv[x].lstrip('-').partition('=')
 
@@ -935,7 +929,7 @@ if __name__ == '__main__':
     #If the user has not provided the bare minimum arguments, default to showing help
     if Email == None or Password == None or OutputDirectory == None:
         ShowHelp()
-        raw_input('')
+        input('')
         exit(0)
 
     #Define an event that will be passed to both the downloader and the zipextractor if enabled, this allows the downloader to signal to the zip extractor that it needs the zip extractor to stop IO operations
@@ -946,7 +940,7 @@ if __name__ == '__main__':
     #If extracting of zip files is enabled create a job queue for the zip extractor and then get an instance of the zip extract and start it
     if Extract:
         #Job queue that we will add the name of zip files to once they are ready to be extracted
-        zipjobqueue = Queue.Queue()
+        zipjobqueue = queue.Queue()
         
         #And get an instance of the zip extractor and start it in its own thread, this allows the next zip file to begin downloading while the previous one is being extracted
         zipextrator = ZipExtrator(zipjobqueue, DiskIOEvent, ZipRegex, OutputDirectory, KeepZip)
@@ -957,47 +951,70 @@ if __name__ == '__main__':
     #If a throtte was specified, get a throttler object, if throttle is false this returns an object that always immediatly returns 
     TokenBucketInst = TokenBucket(Throttle)
 
-    while True:        
-        BB = BackBlazeSession(Email, Password, DiskIOEvent, TokenBucketInst, DiskBuffer, WorkingDirectory, OutputDirectory, threads)
-        
-        #Track if we have found a file to download in this iteration, if we have not then we will sleep for 15 minutes before checking again, otherwise check again immediatly
-        FileFound = False
+    while True:   
+        try:     
+            BB = BackBlazeSession(Email, Password, DiskIOEvent, TokenBucketInst, DiskBuffer, WorkingDirectory, OutputDirectory, threads)
+            
+            #Track if we have found a file to download in this iteration, if we have not then we will sleep for 15 minutes before checking again, otherwise check again immediatly
+            FileFound = False
 
-        #Iterate over restores and search for any that we have not yet downloaded that are not in progress
-        for a in BB.Restores:
-            if a.rid not in DownloadedBackups:
-                if a.restore_in_progress == 'false':
-                    FileFound = True
+            #Build a list of zip file names that are attatched to existing backups
+            ZipFiles = []
+            for a in BB.Restores:
+                ZipFiles.append(a.display_filename)
 
-                    ZipPath = a.Download()
+            #Now iterate over the working directory and find any zip files that are not linked to exising backups and schedule them to be extracted(if enabled, otherwise just move them)
+            for filename in os.listdir(WorkingDirectory):
+                if filename.rpartition('.')[2].lower() == 'zip':
+                    if filename not in ZipFiles:
+                        ZipPath = os.path.join(WorkingDirectory, filename)
+
+                        #If extract zips is enabled
+                        if Extract:
+                            zipjobqueue.put(ZipPath)
+
+                        else:#Otherwise just move the downloaded file to the output location
+                            shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
+            break
+            #Iterate over restores and search for any that we have not yet downloaded that are not in progress
+            for a in BB.Restores:
+                if a.rid not in DownloadedBackups:
+                    if a.restore_in_progress == 'false':
+                        FileFound = True
+
+                        ZipPath = a.Download()
+                        
+                        #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
+                        if Extract:
+                            zipjobqueue.put(ZipPath)
+
+                        else:#Otherwise just move the downloaded file to the output location
+                            shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
+
+                        #Update the list of downloaded backups to include this one
+                        DownloadedBackups.append(a.rid)
+
+                        #And append a line to the downloaded backups file as well so we dont try again if the program is stopped and started
+                        with open('Downloaded.db', 'a') as fil:
+                            fil.write(str(a.rid) + '\n')
+
+                else:#If we have already downloaded this backup, check to make sure the zipfile has been moved/extract and if not add it to the queue
+                    ZipPath = os.path.join(WorkingDirectory, a.display_filename)
                     
-                    #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
-                    if Extract:
-                        zipjobqueue.put(ZipPath)
+                    if os.path.exists(ZipPath):
+                        #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
+                        if Extract:
+                            zipjobqueue.put(ZipPath)
 
-                    else:#Otherwise just move the downloaded file to the output location
-                        shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
+                        else:#Otherwise just move the downloaded file to the output location
+                            shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
 
-                    #Update the list of downloaded backups to include this one
-                    DownloadedBackups.append(a.rid)
-
-                    #And append a line to the downloaded backups file as well so we dont try again if the program is stopped and started
-                    with open('Downloaded.db', 'a') as fil:
-                        fil.write(str(a.rid) + '\n')
-
-            else:#If we have already downloaded this backup, check to make sure the zipfile has been moved/extract and if not add it to the queue
-                ZipPath = os.path.join(WorkingDirectory, a.display_filename)
-                
-                if os.path.exists(ZipPath):
-                    #If we are to extract the zip file, then add the zipfile to the zip extractors job queue
-                    if Extract:
-                        zipjobqueue.put(ZipPath)
-
-                    else:#Otherwise just move the downloaded file to the output location
-                        shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
-
-        #Wait 15 minutes before checking again for more files to download but only if we did not find any files to download
-        if not FileFound:
-            print ('Waiting for more restores to be available')
-            time.sleep(900)
+            #Wait 15 minutes before checking again for more files to download but only if we did not find any files to download
+            if not FileFound:
+                print ('Waiting for more restores to be available')
+                time.sleep(900)
+        except:
+            raise
+            print ('Error checking for backups to download, waiting 5 minutes before retrying')
+            time.sleep(300)
     
