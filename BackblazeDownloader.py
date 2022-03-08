@@ -975,7 +975,7 @@ if __name__ == '__main__':
 
                         else:#Otherwise just move the downloaded file to the output location
                             shutil.move(ZipPath, os.path.join(OutputDirectory, os.path.split(ZipPath)[1]))
-            break
+                            
             #Iterate over restores and search for any that we have not yet downloaded that are not in progress
             for a in BB.Restores:
                 if a.rid not in DownloadedBackups:
